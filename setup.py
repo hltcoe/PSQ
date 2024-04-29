@@ -5,7 +5,7 @@ with open('README.md', 'r') as f:
 
 setuptools.setup(
     name='fast_psq',
-    version='0.0.1',
+    version='0.1.0',
     author='Eugene Yang',
     author_email='eugene.yang@jhu.edu',
     description="Efficient Implementation of Probabilistic Structured Queries",

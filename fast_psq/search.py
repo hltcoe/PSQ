@@ -73,23 +73,31 @@ def search_by_shards(q_vec, qids, shards, n_retrieve) -> Dict[str, List[Tuple[st
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--query_file", type=str, required=True)
-    parser.add_argument("--index_dir", type=str, required=True)
+    parser = argparse.ArgumentParser(description="Search script for fast PSQ")
+    parser.add_argument("--query_source", "--query_file", dest="query_source", type=str, required=True,
+                        help="Path to the tsv query file. Adding prefix `irds:` will direct to use ir_datasets.")
+    parser.add_argument("--query_field", type=str, default='title', help="Query field if using ir_datasets.")
+    parser.add_argument("--index_dir", type=str, required=True, 
+                        help="Path to index")
 
-    parser.add_argument("--query_lang", type=str, required=True)
-    parser.add_argument("--output_file", type=str, required=True)
+    parser.add_argument("--query_lang", type=str, required=True, 
+                        help="Language code of the query. ")
+    parser.add_argument("--output_file", type=str, required=True,
+                        help="Path to the output result file")
 
-    parser.add_argument("--index_prefix", type=str, default='vecpsq')
-    parser.add_argument('--n_retrieve', type=int, default=1000)
-    parser.add_argument('--run_name', type=str, default='fast-psq')
+    parser.add_argument("--index_prefix", type=str, default='vecpsq', help="Prefix of the index file.")
+    parser.add_argument('--n_retrieve', type=int, default=1000, help="Number of document retrieving.")
+    parser.add_argument('--run_name', type=str, default='fast-psq', help="Name of the run")
 
-    parser.add_argument('--qrels', type=str, default=None)
-    parser.add_argument('--metrics', nargs='+', default=['nDCG@20', 'P@10', 'MAP', 'R@100', 'R@1000'])
+    parser.add_argument('--qrels', type=str, default=None, 
+                        help="Path to the qrel file. Adding prefix `irds:` will direct to use ir_datasets.")
+    parser.add_argument('--metrics', nargs='+', default=['nDCG@20', 'P@10', 'MAP', 'R@100', 'R@1000'],
+                        help="List of evaluation metrics for ir_measures.")
 
-    parser.add_argument('--no_preload', action='store_true', default=False)
+    parser.add_argument('--no_preload', action='store_true', default=False, 
+                        help="Whether to preload the index or load them on the fly.")
 
-    parser.add_argument('--verbose', action='store_true', default=False)
+    parser.add_argument('--verbose', action='store_true', default=False, help="Verbose console output.")
 
     args = parser.parse_args()
 
@@ -98,7 +106,14 @@ if __name__ == '__main__':
     tokenizer = PSQTokenizer(args.query_lang)
     vectorizer = PSQVectorizer.load(index_dir/'vectorizer.pkl.gz', target_tokenizer=tokenizer.tokenize)
 
-    queries = [ l.strip().split('\t') for l in open(args.query_file)]
+    if args.query_source.startswith('irds:'):
+        import ir_datasets as irds
+        queries = [ 
+            [getattr(q, 'query_id'), getattr(q, args.query_field)] 
+            for q in irds.load(args.query_source.replace('irds:', '')).queries_iter() 
+        ]
+    else:
+        queries = [ l.strip().split('\t') for l in open(args.query_source)]
     qids = [ q[0] for q in queries ]
 
     q_vec: sp.csr_matrix = vectorizer.make_target_vectors([ q[1] for q in queries ])
@@ -144,4 +159,10 @@ if __name__ == '__main__':
     if args.qrels is not None:
         import ir_measures as irms
         metrics = [ irms.parse_measure(m) for m in args.metrics ]
-        print( irms.calc_aggregate(metrics, irms.read_trec_qrels(args.qrels), irms.read_trec_run(args.output_file)) )
+        if args.qrels.startswith('irds:'):
+            import ir_datasets as irds
+            qrels = irds.load(args.qrels.replace('irds:', '')).qrels_iter()
+        else:
+            qrels = irms.read_trec_qrels(args.qrels)
+
+        print( irms.calc_aggregate(metrics, qrels, irms.read_trec_run(args.output_file)) )

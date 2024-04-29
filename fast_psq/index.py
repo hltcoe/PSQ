@@ -32,13 +32,28 @@ logger = logging.getLogger("fast-psq-index")
 
 
 def read_documents(args):
-    with open(args.doc_file) as f:
-        for line in f:
-            temp = json.loads(line)
-            title = strip_newlines(temp[args.title]) 
-            text = strip_newlines(temp[args.body])
-            yield temp[args.docid], title + " " + text
+    if args.doc_source.startswith('irds:'):
+        import ir_datasets as irds
+        ds = irds.load(args.doc_source.replace('irds:', ''))
+        for doc in ds.docs_iter():
+            doc = doc._asdict()
+            yield doc[args.docid], strip_newlines(doc[args.title])  + " " + strip_newlines(doc[args.body])
 
+    else:
+        with open(args.doc_source) as f:
+            for line in f:
+                temp = json.loads(line)
+                title = strip_newlines(temp[args.title]) 
+                text = strip_newlines(temp[args.body])
+                yield temp[args.docid], title + " " + text
+
+
+def count_lines(source: str):
+    if source.startswith('irds:'):
+        import ir_datasets as irds
+        return len(irds.load(args.doc_source.replace('irds:', '')).docs)
+    return sum(1 for _ in open(source))     
+    
 
 def prune_cdf(probs: List[Tuple[str, float]], max_cdf: float=1.0):
     probs = sorted(probs, key=lambda x: -x[1])
@@ -126,7 +141,7 @@ def index_chunk(args, chunk_info: Tuple[int, List[Tuple[str, str]]]):
 
 def index(args):
     output_dir = Path(args.output_dir)
-    logger.info(f"Running indexing on doc file {args.doc_file}")
+    logger.info(f"Running indexing on doc file {args.doc_source}")
 
     logger.info(f"Loading psq dictionary {args.raw_dictionary}")
     psq_matrix = prune_dictionary(
@@ -140,7 +155,7 @@ def index(args):
     vectorizer.save(output_dir / "vectorizer.pkl.gz")
 
     logger.info(f"Counting docs...")
-    ndocs = sum(1 for _ in open(args.doc_file)) 
+    ndocs = count_lines(args.doc_source)
 
     # determine chunk size based on numer of workers
     chunk_size = min(args.chunk_size, int(np.ceil(ndocs/args.nworkers)))
@@ -225,48 +240,77 @@ def merge_chunks(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Script that generates inverted index from a jsonl index file")
-    parser.add_argument("--doc_file", type=str, default=None)
-    parser.add_argument("--from_existing_index", type=str, default=None)
+    parser = argparse.ArgumentParser(description="Indexing script for fast PSQ.")
+    parser.add_argument("--doc_source", "--doc_file", dest="doc_source", type=str, default=None,
+                        help="Path to document file. Adding prefix `irds:` will direct to use ir_datasets.")
+    parser.add_argument("--from_existing_index", type=str, default=None,
+                        help="Path to an existing unmerge index if only executing the merging part.")
 
-    parser.add_argument("--lang", type=str, required=True)
+    parser.add_argument("--lang", type=str, required=True, help="Language code of the document.")
 
-    parser.add_argument("--docid", type=str, default="docno")
-    parser.add_argument("--title", type=str, default="title")
-    parser.add_argument("--body", type=str, default="body")
+    parser.add_argument("--docid", type=str, default="docno", help="Field name for document id.")
+    parser.add_argument("--title", type=str, default="title", help="Field name for title.")
+    parser.add_argument("--body", type=str, default="body", help="Field name for body text")
 
-    parser.add_argument("--raw_dictionary", "--raw_dict", "--psq_file", dest="raw_dictionary", type=str, required=True) 
-    parser.add_argument("--count_file", type=str, default="hltcoe/psq_translation_tables:eng.cnt")
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--index_prefix", type=str, default='vecpsq')
+    parser.add_argument("--raw_dictionary", "--raw_dict", "--psq_file", dest="raw_dictionary", type=str, required=True,
+                        help="Local or Huggingface path to the alignment matrix.")
+    parser.add_argument("--count_file", type=str, default="hltcoe/psq_translation_tables:eng.cnt",
+                        help="Local or Huggingface path to the query language token frequency count; default to an "
+                             "English count file available on Huggingface.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Path to output index.")
+    parser.add_argument("--index_prefix", type=str, default='vecpsq', help="Prefix of the index file.")
 
-    parser.add_argument('--alpha', type=float, default=0.1)
+    parser.add_argument('--alpha', type=float, default=0.1, 
+                        help="Alpha value for interpolating the query language prior probability with the translation"
+                             "probabilities.")
 
     # pruning parameters 
-    parser.add_argument('--min_translation_prob', type=float, default=0)
-    parser.add_argument('--max_translation_alternatives', type=int, default=-1)
-    parser.add_argument('--max_translation_cdf', type=float, default=1.0)
-    parser.add_argument('--min_token_score', type=float, default=1e-9)
-    parser.add_argument('--max_translated_doc_length', type=int, default=-1) 
-    parser.add_argument('--max_translated_doc_ratio', type=float, default=-1) 
+    parser.add_argument('--min_translation_prob', type=float, default=0, 
+                        help="Minimum translation probability for each possible translation token in the target language. "
+                              "0.0 indicates no pruning.")
+    parser.add_argument('--max_translation_alternatives', type=int, default=-1,
+                        help="Maximum number of alternative translation token for each source token. "
+                             "-1 indicates no pruning.")
+    parser.add_argument('--max_translation_cdf', type=float, default=1.0, 
+                        help="Maximum cumulative probability function (CDF) cutoff for each source token. "
+                             "1.0 indicates no pruning.")
+    parser.add_argument('--min_token_score', type=float, default=1e-9, 
+                        help="Minimum token score, i.e., log of the interpolated translation probability. "
+                             "0.0 indicates no pruning.")
+    parser.add_argument('--max_translated_doc_length', type=int, default=-1,
+                        help="Maximum number of expected target terms in the translated document. "
+                             "-1 indicates no pruning.") 
+    parser.add_argument('--max_translated_doc_ratio', type=float, default=-1, 
+                        help="Maximum expansion ratio of the translated document compared to the original document length. "
+                             "-1 indicates no pruning.") 
 
     # https://dl.acm.org/doi/10.1145/383952.383958
-    parser.add_argument('--posting_list_k', type=int, default=-1)
-    parser.add_argument('--posting_list_epsilon', type=float, default=0.1)
+    parser.add_argument('--posting_list_k', type=int, default=-1,
+                        help="Maximum number of posting in a posting list. Requires --do_merge. -1 indicates no pruning.")
+    parser.add_argument('--posting_list_epsilon', type=float, default=0.1,
+                        help="Score cutoff ratio to the maximum score in a posting list. Requires --do_merge.")
 
-    parser.add_argument('--do_merge', action='store_true', default=False)
-    parser.add_argument('--merge_nway', type=int, default=2)
+    parser.add_argument('--do_merge', action='store_true', default=False,
+                        help="Flag for merging the index chunks. "
+                             "Not require for search but necessary if pruning the posting lists.")
+    parser.add_argument('--merge_nway', type=int, default=2,
+                        help="Number of chunks to merge at once.")
 
-    parser.add_argument('--chunk_size', type=int, default=5_000)
-    parser.add_argument('--compression', action='store_true', default=False)
-    parser.add_argument('--float64', action='store_true', default=False) 
+    parser.add_argument('--chunk_size', type=int, default=5_000,
+                        help="Maximum number of documents in each index chunk.")
+    parser.add_argument('--compression', action='store_true', default=False,
+                        help="Whether to use compression to store the chunks.")
+    parser.add_argument('--float64', action='store_true', default=False, 
+                        help="Whether to store 64-bit doubles. Default storing 32-bit floats.") 
 
-    parser.add_argument('--nworkers', type=int, default=20)
-    parser.add_argument('--verbose', action='store_true', default=False)
+    parser.add_argument('--nworkers', type=int, default=20,
+                        help="Number of multiprocessing works for indexing and merging. ")
+    parser.add_argument('--verbose', action='store_true', default=False,
+                        help="Verbose for more console output.")
 
     args = parser.parse_args()
 
-    assert (args.doc_file is None) != (args.from_existing_index is None), \
+    assert (args.doc_source is None) != (args.from_existing_index is None), \
         "Need to specify either `doc_file` or `from_existing_index`."
 
     assert (args.max_translated_doc_ratio == -1) or (args.max_translated_doc_length == -1), \
